@@ -201,37 +201,243 @@ install_nodejs() {
 }
 
 # ─── PHP + Composer + Symfony CLI ─────────────────────────────────────────────
-install_php() {
-  section "PHP 8.x"
-  if ! is_installed php; then
-    case "$OS" in
-      macos)
-        pkg_install php
-        ;;
-      debian)
-        sudo apt-get install -y software-properties-common
-        sudo add-apt-repository ppa:ondrej/php -y
-        pkg_update
-        pkg_install php8.3 php8.3-cli php8.3-fpm \
-          php8.3-mysql php8.3-pgsql php8.3-sqlite3 \
-          php8.3-intl php8.3-zip php8.3-gd php8.3-curl \
-          php8.3-mbstring php8.3-xml php8.3-bcmath \
-          php8.3-redis php8.3-opcache
-        ;;
-      fedora)
-        pkg_install php php-cli php-fpm php-mysqlnd php-pgsql \
-          php-intl php-zip php-gd php-curl php-mbstring php-xml php-bcmath
-        ;;
-      arch)
-        pkg_install php php-intl php-gd php-sqlite
-        ;;
-    esac
-    success "PHP $(php -r 'echo PHP_VERSION;') installé"
-  else
-    success "PHP $(php -r 'echo PHP_VERSION;') déjà présent"
+
+_PHP_SELECTED_VERSIONS=()
+
+_select_php_versions() {
+  local -a versions=("8.1" "8.2" "8.3" "8.4")
+  local -a labels=(
+    "PHP 8.1  — fin de vie nov. 2025 (legacy, PrestaShop…)"
+    "PHP 8.2  — support actif jusqu'en déc. 2026"
+    "PHP 8.3  — recommandée · support actif jusqu'en nov. 2027"
+    "PHP 8.4  — dernière stable · support actif jusqu'en déc. 2028"
+  )
+
+  echo ""
+  echo -e "  ${BOLD}Versions disponibles :${NC}"
+  echo ""
+  local i
+  for i in "${!versions[@]}"; do
+    printf "    ${CYAN}[%d]${NC} %s\n" "$((i+1))" "${labels[$i]}"
+  done
+  echo ""
+  echo -e "  ${BOLD}Extensions incluses avec chaque version :${NC}"
+  echo -e "    Core  : bcmath · curl · fpm · gd · intl · mbstring · opcache · xml · zip"
+  echo -e "    BDD   : mysql · pgsql · sqlite3"
+  echo -e "    Cache : redis"
+  echo -e "    Optionnel (à la demande) : xdebug · imagick"
+  echo ""
+  echo -en "${YELLOW}?${NC} Numéros à installer (ex: ${BOLD}3${NC}  |  ${BOLD}2 3${NC}  |  ${BOLD}1 2 3 4${NC}) [défaut: ${BOLD}3${NC}] : "
+
+  local input
+  read -r input </dev/tty
+  input="${input:-3}"
+
+  _PHP_SELECTED_VERSIONS=()
+  local num
+  for num in $input; do
+    if [[ "$num" =~ ^[1-4]$ ]]; then
+      _PHP_SELECTED_VERSIONS+=("${versions[$((num-1))]}")
+    else
+      warn "Numéro invalide ignoré : $num"
+    fi
+  done
+
+  [[ ${#_PHP_SELECTED_VERSIONS[@]} -gt 0 ]] && info "Versions sélectionnées : ${_PHP_SELECTED_VERSIONS[*]}"
+}
+
+_install_php_macos() {
+  local version="$1" xdebug="$2" imagick="$3"
+
+  if ! brew tap | grep -q "shivammathur/php"; then
+    info "Ajout du tap shivammathur/php..."
+    brew tap shivammathur/php
   fi
 
-  # Composer
+  local formula="shivammathur/php/php@${version}"
+  if brew list "$formula" &>/dev/null 2>&1; then
+    success "PHP $version déjà présent"
+  else
+    info "Installation de PHP $version..."
+    brew install "$formula" && success "PHP $version installé"
+  fi
+
+  local pecl_bin
+  pecl_bin="$(brew --prefix "$formula" 2>/dev/null)/bin/pecl"
+
+  if [[ "$xdebug" == "true" ]] && [[ -x "$pecl_bin" ]]; then
+    info "Xdebug pour PHP $version..."
+    echo "" | "$pecl_bin" install xdebug 2>/dev/null \
+      && success "Xdebug PHP $version installé" \
+      || warn "Xdebug PHP $version : échec (peut-être déjà installé)"
+  fi
+
+  if [[ "$imagick" == "true" ]] && [[ -x "$pecl_bin" ]]; then
+    brew list imagemagick &>/dev/null || brew install imagemagick
+    echo "" | "$pecl_bin" install imagick 2>/dev/null \
+      && success "Imagick PHP $version installé" \
+      || warn "Imagick PHP $version : échec"
+  fi
+}
+
+_install_php_debian() {
+  local version="$1" xdebug="$2" imagick="$3"
+  local v="php${version}"
+
+  local pkgs=(
+    "${v}" "${v}-cli" "${v}-fpm" "${v}-common"
+    "${v}-mysql" "${v}-pgsql" "${v}-sqlite3"
+    "${v}-bcmath" "${v}-curl" "${v}-gd" "${v}-intl"
+    "${v}-mbstring" "${v}-opcache" "${v}-xml" "${v}-zip"
+    "${v}-redis"
+  )
+
+  info "Installation de PHP $version + extensions..."
+  pkg_install "${pkgs[@]}" && success "PHP $version installé"
+
+  if [[ "$xdebug" == "true" ]]; then
+    pkg_install "${v}-xdebug" \
+      && success "Xdebug PHP $version installé" \
+      || warn "Xdebug PHP $version : échec"
+  fi
+
+  if [[ "$imagick" == "true" ]]; then
+    pkg_install "${v}-imagick" \
+      && success "Imagick PHP $version installé" \
+      || warn "Imagick PHP $version : non disponible via apt"
+  fi
+}
+
+_install_php_fedora() {
+  local version="$1" xdebug="$2" imagick="$3"
+  local mv="${version//./}"
+  local p="php${mv}"
+
+  if ! rpm -q remi-release &>/dev/null; then
+    info "Ajout du dépôt Remi..."
+    local fver
+    fver=$(rpm -E %fedora)
+    sudo dnf install -y "https://rpms.remirepo.net/fedora/remi-release-${fver}.rpm" 2>/dev/null \
+      || warn "Dépôt Remi : ajout manuel requis"
+  fi
+
+  local pkgs=(
+    "${p}" "${p}-php-cli" "${p}-php-fpm"
+    "${p}-php-mysqlnd" "${p}-php-pgsql" "${p}-php-sqlite3"
+    "${p}-php-bcmath" "${p}-php-gd" "${p}-php-intl"
+    "${p}-php-mbstring" "${p}-php-opcache" "${p}-php-xml" "${p}-php-zip"
+    "${p}-php-pecl-redis"
+  )
+
+  info "Installation de PHP $version + extensions..."
+  pkg_install "${pkgs[@]}" && success "PHP $version installé"
+
+  if [[ "$xdebug" == "true" ]]; then
+    pkg_install "${p}-php-pecl-xdebug3" \
+      && success "Xdebug PHP $version installé" \
+      || warn "Xdebug PHP $version : échec"
+  fi
+
+  if [[ "$imagick" == "true" ]]; then
+    pkg_install "${p}-php-pecl-imagick" \
+      && success "Imagick PHP $version installé" \
+      || warn "Imagick PHP $version : échec"
+  fi
+}
+
+_install_php_arch() {
+  local version="$1" xdebug="$2" imagick="$3"
+  local mv="${version//./}"
+
+  local aur=""
+  is_installed yay  && aur="yay"
+  is_installed paru && aur="paru"
+
+  if [[ -z "$aur" ]]; then
+    warn "PHP $version sur Arch nécessite yay ou paru (AUR) — ignoré."
+    return
+  fi
+
+  info "Installation de PHP $version via $aur..."
+  "$aur" -S --noconfirm "php${mv}" "php${mv}-intl" "php${mv}-gd" "php${mv}-sqlite" \
+    && success "PHP $version installé" \
+    || warn "PHP $version : échec AUR"
+
+  if [[ "$xdebug" == "true" ]]; then
+    "$aur" -S --noconfirm "php${mv}-xdebug" \
+      && success "Xdebug PHP $version installé" \
+      || warn "Xdebug PHP $version : non disponible"
+  fi
+}
+
+_set_default_php() {
+  local version="$1"
+  case "$OS" in
+    macos)
+      brew unlink php 2>/dev/null || true
+      brew link --force --overwrite "shivammathur/php/php@${version}" 2>/dev/null \
+        && success "PHP $version activé par défaut" \
+        || warn "Lien manuel : brew link --force shivammathur/php/php@${version}"
+      ;;
+    debian)
+      sudo update-alternatives --set php "/usr/bin/php${version}" 2>/dev/null \
+        && success "PHP $version activé (update-alternatives)" \
+        || warn "Configure manuellement : sudo update-alternatives --config php"
+      ;;
+    fedora)
+      warn "Sur Fedora, utilise '/usr/bin/php${version//./}' ou configure update-alternatives."
+      ;;
+    arch)
+      warn "Sur Arch, utilise '/usr/bin/php${version//./}' directement."
+      ;;
+  esac
+}
+
+install_php() {
+  section "PHP — Versions et extensions"
+
+  _select_php_versions
+
+  if [[ ${#_PHP_SELECTED_VERSIONS[@]} -eq 0 ]]; then
+    warn "Aucune version PHP sélectionnée — étape ignorée."
+    return
+  fi
+
+  local xdebug=false imagick=false
+  ask "Installer Xdebug (débogage PHP, recommandé en dev) ?" && xdebug=true
+  ask "Installer Imagick (traitement d'images avancé) ?"      && imagick=true
+
+  if [[ "$OS" == "debian" ]]; then
+    if ! grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
+      info "Ajout du PPA ondrej/php..."
+      sudo apt-get install -y software-properties-common
+      sudo add-apt-repository ppa:ondrej/php -y
+      pkg_update
+    fi
+  fi
+
+  for version in "${_PHP_SELECTED_VERSIONS[@]}"; do
+    echo ""
+    echo -e "${BOLD}${CYAN}  ── PHP $version ──${NC}"
+    case "$OS" in
+      macos)  _install_php_macos  "$version" "$xdebug" "$imagick" ;;
+      debian) _install_php_debian "$version" "$xdebug" "$imagick" ;;
+      fedora) _install_php_fedora "$version" "$xdebug" "$imagick" ;;
+      arch)   _install_php_arch   "$version" "$xdebug" "$imagick" ;;
+    esac
+  done
+
+  if [[ ${#_PHP_SELECTED_VERSIONS[@]} -gt 1 ]]; then
+    local last="${_PHP_SELECTED_VERSIONS[-1]}"
+    echo ""
+    echo -e "${BOLD}Versions installées :${NC} ${_PHP_SELECTED_VERSIONS[*]}"
+    echo -en "${YELLOW}?${NC} Version à activer par défaut ? [${BOLD}${last}${NC}] : "
+    local default_ver
+    read -r default_ver </dev/tty
+    _set_default_php "${default_ver:-$last}"
+  fi
+
+  # ── Composer ──
   if ! is_installed composer; then
     info "Installation de Composer..."
     curl -sS https://getcomposer.org/installer | php -- --install-dir=/tmp --filename=composer
@@ -242,12 +448,10 @@ install_php() {
     success "Composer déjà présent"
   fi
 
-  # Symfony CLI
+  # ── Symfony CLI ──
   if ! is_installed symfony; then
     info "Installation de Symfony CLI..."
-    curl -1sLf 'https://dl.cloudsmith.io/public/symfony/stable/setup.$(. /etc/os-release 2>/dev/null && echo "${ID:-debian}").sh' | sudo bash 2>/dev/null \
-      || curl -sS https://get.symfony.com/cli/installer | bash
-    # Déplacer dans PATH si installé localement
+    curl -sS https://get.symfony.com/cli/installer | bash
     local symfony_bin
     symfony_bin="$(find "$HOME" -name symfony -type f 2>/dev/null | head -1)"
     if [[ -n "$symfony_bin" && ! -f /usr/local/bin/symfony ]]; then
@@ -633,7 +837,7 @@ main() {
   if ask "Outils de base (git, curl, jq, make…) ?";             then install_base; fi
   if ask "Visual Studio Code + extensions ?";                    then install_vscode; fi
   if ask "Node.js (via nvm) + npm globals ?";                    then install_nodejs; fi
-  if ask "PHP 8.3 + Composer + Symfony CLI ?";                   then install_php; fi
+  if ask "PHP (choix de version) + Composer + Symfony CLI ?";    then install_php; fi
   if ask "Python 3.12 (via pyenv) ?";                            then install_python; fi
   if ask ".NET SDK 8 (C# / ASP.NET) ?";                         then install_dotnet; fi
   if ask "Docker ?";                                             then install_docker; fi
